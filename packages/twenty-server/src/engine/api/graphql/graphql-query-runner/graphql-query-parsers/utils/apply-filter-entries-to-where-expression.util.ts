@@ -8,7 +8,37 @@ type FilterWalkContext = {
   objectNameSingular: string;
   fieldParser: GraphqlQueryFilterFieldParser;
   useDirectTableReference: boolean;
+  isNegated?: boolean;
 };
+
+// Inside a negation, a leaf comparison evaluating to NULL must count as "not
+// matching" so that NOT keeps the row, mirroring in-memory record matching
+const wrapWithNullSafeLeafConditions = (
+  whereExpression: WhereExpressionBuilder,
+): WhereExpressionBuilder =>
+  new Proxy(whereExpression, {
+    get(target, property, receiver) {
+      if (
+        property === 'where' ||
+        property === 'andWhere' ||
+        property === 'orWhere'
+      ) {
+        return (condition: unknown, parameters?: Record<string, unknown>) => {
+          const nullSafeCondition =
+            typeof condition === 'string'
+              ? `COALESCE((${condition}), FALSE)`
+              : condition;
+
+          // oxlint-disable-next-line typescript/no-explicit-any
+          (target as any)[property](nullSafeCondition, parameters);
+
+          return receiver;
+        };
+      }
+
+      return Reflect.get(target, property, receiver);
+    },
+  });
 
 export const applyFilterEntriesToWhereExpression = ({
   whereExpression,
@@ -68,14 +98,19 @@ const applyFilterEntry = (
       applyCondition(
         whereExpression,
         new NotBrackets((negatedWhereExpression) => {
-          applyFilterEntries(negatedWhereExpression, filterValue, context);
+          applyFilterEntries(negatedWhereExpression, filterValue, {
+            ...context,
+            isNegated: true,
+          });
         }),
         isFirst,
       );
       break;
     default:
       context.fieldParser.parse(
-        whereExpression,
+        context.isNegated === true
+          ? wrapWithNullSafeLeafConditions(whereExpression)
+          : whereExpression,
         context.outerQueryBuilder,
         context.objectNameSingular,
         filterKey,
